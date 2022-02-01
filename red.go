@@ -2,176 +2,92 @@ package main
 
 import (
 	"context"
-	"errors"
+	"flag"
 	"fmt"
+	"github.com/kballard/go-shellquote"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 	"io"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// ActivityGeneratorConfig contains the configuration for an ActivityGenerator.
-type ActivityGeneratorConfig struct {
-	Log *logrus.Logger
-}
-
-// ActivityGenerator is able to generate various types of activity.
-type ActivityGenerator struct {
-	Log *logrus.Entry
-}
-
-// NewActivityGenerator creates an activity generator.
-func NewActivityGenerator(conf ActivityGeneratorConfig) (*ActivityGenerator, error) {
-	log := conf.Log
-	if log == nil {
-		log = logrus.New()
-		log.Formatter = &logrus.JSONFormatter{
-			TimestampFormat: time.RFC3339Nano,
-			FieldMap: logrus.FieldMap{
-				logrus.FieldKeyTime: "timestamp",
-			},
-		}
-	}
-	u, err := user.Current()
-	if err != nil {
-		return nil, fmt.Errorf("unable to get user information: %w", err)
-	}
-	return &ActivityGenerator{
-		// Add the fields common to all types of activity.
-		Log: log.WithFields(logrus.Fields{
-			"username":     u.Username,
-			"process name": os.Args[0],
-			// May be difficult to parse this if there are spaces in an
-			// argument.
-			"process command line": strings.Join(os.Args, " "),
-			"process ID":           os.Getpid(),
-		}),
-	}, nil
-}
-
-// RunProcess runs a process with the executable specified by path.
+// LocalhostTCPConnection creates a TCP connection over localhost and send the
+// data from r to it. The data read on the server side will be written to w.
 //
-// This function blocks until the program returns.
-func (ag *ActivityGenerator) RunProcess(ctx context.Context, path string, args []string) error {
-	cmd := exec.CommandContext(ctx, path, args...)
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	err := cmd.Start()
-	errLog(ag.Log, err, "process start")
-	if err != nil {
-		return fmt.Errorf("error starting command: %w", err)
-	}
-	// May not actually be an error for a command to return non-zero status
-	// code.
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("error running command: %w", err)
-	}
-	return nil
-}
+// This function uses the deadline from ctx to prevent indefinite blocking, if
+// provided.
+func LocalhostTCPConnect(ctx context.Context, log *logrus.Entry, r io.Reader, w io.Writer) (sent int64, e error) {
+	dl, dlOk := ctx.Deadline()
 
-// CreateFile creates a file at the given path.
-func (ag *ActivityGenerator) CreateFile(path string) (*os.File, error) {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return nil, fmt.Errorf("unable to get absolute path from %q: %w", path, err)
-	}
-	file, err := os.Create(absPath)
-	l := ag.Log.WithFields(logrus.Fields{
-		"file activity": "create",
-		"file path":     absPath,
+	l, err := net.ListenTCP("tcp", &net.TCPAddr{
+		IP:   net.IPv4(127, 0, 0, 1),
+		Port: 0, // Randomly chosen open port.
 	})
-	errLog(l, err, "create file")
 	if err != nil {
-		return nil, fmt.Errorf("unable to create file: %w", err)
-	}
-	return file, nil
-}
-
-// ModifyFile modifies file by writing the data from reader to it.
-func (ag *ActivityGenerator) ModifyFile(ctx context.Context, file *os.File, reader io.Reader) error {
-	// Add filepath logging.
-	if file == nil {
-		return errors.New("error attempting to modify nil file")
-	}
-	absPath, err := filepath.Abs(file.Name())
-	if err != nil {
-		return fmt.Errorf("unable to get absolute path from %q: %w", file.Name(), err)
-	}
-
-	// Set write deadline from ctx, if applicable.
-	ctxDl, ctxDlOk := ctx.Deadline()
-	if ctxDlOk {
-		if err := file.SetWriteDeadline(ctxDl); err != nil && !errors.Is(err, os.ErrNoDeadline) {
-			return fmt.Errorf("unable to set write deadline: %w", err)
-		}
-	}
-
-	_, err = io.Copy(file, reader)
-	l := ag.Log.WithFields(logrus.Fields{
-		"file activity": "modify",
-		"file path":     absPath,
-	})
-	errLog(l, err, "modify file")
-	if err != nil {
-		return errors.New("error attempting to modify file")
-	}
-	return nil
-}
-
-// DeleteFile deletes the file at path.
-func (ag *ActivityGenerator) DeleteFile(path string) error {
-	absPath, err := filepath.Abs(path)
-	if err != nil {
-		return fmt.Errorf("unable to get absolute path from %q: %w", path, err)
-	}
-	l := ag.Log.WithFields(logrus.Fields{
-		"file activity": "delete",
-		"file path":     absPath,
-	})
-	err = os.Remove(path)
-	errLog(l, err, "delete file")
-	if err != nil {
-		return fmt.Errorf("error attempting to delete file: %w", err)
-	}
-	return nil
-}
-
-// ConnectAndTransmit connects to addr and transmits the data in payload over a
-// TCP connection.
-func (ag *ActivityGenerator) ConnectAndTransmit(ctx context.Context, addr string, payload io.Reader) error {
-	if payload == nil {
-		return errors.New("invalid nil payload io.Reader")
-	}
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return fmt.Errorf("unable to connect to address %q: %w", addr, err)
+		return 0, fmt.Errorf("unable to create TCP listener: %w", err)
 	}
 	defer func() {
-		if err := conn.Close(); err != nil {
-			ag.Log.WithError(err).Error("close client network connection")
+		if err := l.Close(); err != nil {
+			log.WithError(err).Error("close TCP listener")
 		}
 	}()
-	var (
-		localAddr  = conn.LocalAddr()
-		remoteAddr = conn.RemoteAddr()
-		sent       int64
-		l          = ag.Log.WithFields(logrus.Fields{
-			"destination address": remoteAddr.String(),
-			"source address":      localAddr.String(),
-			"protocol":            localAddr.Network(),
-		})
-	)
-	sent, err = io.Copy(conn, payload)
-	errLog(l.WithField("data sent (bytes)", sent), err, "data transmission")
-	if err != nil {
-		return fmt.Errorf("error transmitting data: %w", err)
+	if dlOk {
+		if err := l.SetDeadline(dl); err != nil {
+			return 0, fmt.Errorf("unable to set listener deadline: %w", err)
+		}
 	}
-	return nil
+
+	var g, _ = errgroup.WithContext(ctx)
+	g.Go(func() error {
+		conn, err := l.Accept()
+		if err != nil {
+			return fmt.Errorf("error accepting connection: %w", err)
+		}
+		if dlOk {
+			if err := conn.SetReadDeadline(dl); err != nil {
+				return fmt.Errorf("unable to set server connection deadline: %w", err)
+			}
+		}
+		_, err = io.Copy(w, conn)
+		if err != nil {
+			return fmt.Errorf("error copying data from server connection: %w", err)
+		}
+		return nil
+	})
+
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "tcp", l.Addr().String())
+	if err != nil {
+		return 0, fmt.Errorf("unable to connect to loopback TCP listener: %w", err)
+	}
+
+	sent, err = io.Copy(conn, r)
+	log = log.WithFields(logrus.Fields{
+		"destination address": conn.RemoteAddr().String(),
+		"source address":      conn.LocalAddr().String(),
+		"protocol":            conn.LocalAddr().Network(),
+		"data sent (bytes)":   sent,
+	})
+	errLog(log, err, "data transmission")
+	if err != nil {
+		return sent, fmt.Errorf("error copying data to client connection: %w", err)
+	}
+	if err := conn.Close(); err != nil {
+		return sent, fmt.Errorf("error closing client connection: %w", err)
+	}
+
+	if err := g.Wait(); err != nil {
+		return sent, fmt.Errorf("server listener error: %w", err)
+	}
+	return sent, nil
 }
 
 func errLog(l *logrus.Entry, e error, msg string) {
@@ -182,4 +98,116 @@ func errLog(l *logrus.Entry, e error, msg string) {
 	l.Info(msg)
 }
 
-func main() {}
+// RunActivities runs five different activities to trigger events with the EDR
+// agent.
+func RunActivities(ctx context.Context, l *logrus.Logger, directory, fileExt string, arguments []string) error {
+	u, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("unable to get user information: %w", err)
+	}
+	log := l.WithFields(logrus.Fields{
+		"username":             u.Username,
+		"process name":         os.Args[0],
+		"process command line": strings.Join(os.Args, " "),
+		"process ID":           os.Getpid(),
+	})
+
+	// Run process.
+	cmd := exec.CommandContext(ctx, "echo", arguments...)
+	err = cmd.Start()
+	errLog(log, err, "process start")
+	if err != nil {
+		return fmt.Errorf("error starting the command: %w", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("command error: %w", err)
+	}
+
+	// Create file.
+	if directory == "" {
+		directory = os.TempDir()
+	}
+	directory, err = filepath.Abs(directory)
+	if err != nil {
+		return fmt.Errorf("unable to get absolute path for directory: %w", err)
+	}
+	r := rand.New(rand.NewSource(time.Now().Unix()))
+	path := filepath.Join(directory, strconv.Itoa(r.Intn(1_000_000))+fileExt)
+	fLog := log.WithFields(logrus.Fields{
+		"file path":     path,
+		"file activity": "create",
+	})
+	f, err := os.Create(path)
+	errLog(fLog, err, "create file")
+	if err != nil {
+		return fmt.Errorf("unable to create file: %w", err)
+	}
+
+	// Run code in closure with defer to ensure attempt is made to close and
+	// delete file before moving on to the network transmission activity.
+	err = func() (e error) {
+		defer func() {
+			// Close file.
+			if err := f.Close(); err != nil {
+				log.WithError(err).Error("close file")
+			}
+
+			// Delete file.
+			err = os.Remove(f.Name())
+			errLog(fLog.WithField("file activity", "delete"), err, "delete file")
+			if err != nil && e == nil {
+				e = fmt.Errorf("unable to delete file: %w", err)
+			}
+		}()
+
+		// Modify file.
+		_, err = f.WriteString("file append")
+		errLog(fLog.WithField("file activity", "modify"), err, "modify file")
+		if err != nil {
+			return fmt.Errorf("unable to write to string: %w", err)
+		}
+		return nil
+	}()
+	if err != nil {
+		return err
+	}
+
+	// Network connection and data transmission.
+	_, err = LocalhostTCPConnect(ctx, log, strings.NewReader("hello"), io.Discard)
+	if err != nil {
+		return fmt.Errorf("unable to transmit data over a network connection: %w", err)
+	}
+
+	return nil
+}
+
+func main() {
+	// Get the command line arguments.
+	dir := flag.String("file-directory", "", "directory to create file (defaults to OS temporary directory)")
+	ext := flag.String("file-extension", ".txt", "extension for file")
+	args := flag.String("process-arguments", "", "arguments for program to run (shell quoted)")
+	flag.Parse()
+
+	// Use structured JSON for the output format.
+	l := logrus.New()
+	l.Formatter = &logrus.JSONFormatter{
+		TimestampFormat: time.RFC3339Nano,
+		FieldMap: logrus.FieldMap{
+			logrus.FieldKeyTime: "timestamp",
+		},
+	}
+
+	// Parse out the process arguments like a POSIX shell.
+	pArgs, err := shellquote.Split(*args)
+	if err != nil {
+		l.Fatalf("Invalid process arguments: %v", err)
+	}
+
+	// Run the activities with a timeout to hopefully stop the program in the
+	// event of unexpectedly long blocking call.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := RunActivities(ctx, l, *dir, *ext, pArgs); err != nil {
+		l.Fatalf("Error running activities: %v", err)
+	}
+}
