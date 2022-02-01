@@ -44,11 +44,11 @@ sudo dtruss -f sudo -u "${USER}" ./red
 For Linux (with sufficiently privileged user):
 ```shell
 go build .
-strace ./red
+strace -f ./red
 ```
 
 For Linux via Dockerfile:
 ```shell
 docker build -t red .
-docker run -it --rm --privileged red strace /app/red
+docker run -it --rm --privileged red strace -f /app/red
 ```
